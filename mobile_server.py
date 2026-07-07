@@ -212,29 +212,123 @@ def _get_local_ip() -> str:
 
 
 def _try_upnp(port: int) -> str | None:
+    import urllib.request
+    import urllib.parse
+    import xml.etree.ElementTree as ET
+
+    # --- SSDP discovery ---
+    SSDP_ADDR = "239.255.255.250"
+    SSDP_PORT = 1900
+    msg = (
+        "M-SEARCH * HTTP/1.1\r\n"
+        f"HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n"
+        'MAN: "ssdp:discover"\r\n'
+        "MX: 2\r\n"
+        "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n\r\n"
+    )
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.settimeout(3)
     try:
-        import miniupnpc
-        upnp = miniupnpc.UPnP()
-        upnp.discoverdelay = 200
-        found = upnp.discover()
-        if not found:
-            print("[Mobile] ⚠️  UPnP: no gateway found")
-            return None
-        upnp.selectigd()
-        local_ip = _get_local_ip()
-        result = upnp.addportmapping(
-            port, "TCP", local_ip, port, "JARVIS Remote", ""
-        )
-        if result is False:
-            print("[Mobile] ⚠️  UPnP: port mapping failed (may already exist)")
-        external_ip = upnp.externalipaddress()
-        return external_ip
-    except ImportError:
-        print("[Mobile] ℹ️  UPnP unavailable — run: pip install miniupnpc")
+        sock.sendto(msg.encode(), (SSDP_ADDR, SSDP_PORT))
+        location = None
+        while True:
+            try:
+                data, _ = sock.recvfrom(2048)
+                for line in data.decode("utf-8", errors="ignore").splitlines():
+                    if line.upper().startswith("LOCATION:"):
+                        location = line.split(":", 1)[1].strip()
+                        break
+                if location:
+                    break
+            except socket.timeout:
+                break
+    finally:
+        sock.close()
+
+    if not location:
+        print("[Mobile] ⚠️  UPnP: no gateway found")
         return None
+
+    # --- Fetch device XML ---
+    try:
+        with urllib.request.urlopen(location, timeout=5) as r:
+            xml_data = r.read()
+        root = ET.fromstring(xml_data)
     except Exception as e:
-        print(f"[Mobile] ⚠️  UPnP error: {e}")
+        print(f"[Mobile] ⚠️  UPnP: device fetch failed: {e}")
         return None
+
+    # --- Find WANIPConnection or WANPPPConnection control URL ---
+    parsed_loc = urllib.parse.urlparse(location)
+    base = f"{parsed_loc.scheme}://{parsed_loc.netloc}"
+    control_url = None
+    service_type = None
+    for svc in root.iter():
+        tag = svc.tag.split("}")[-1]
+        if tag == "service":
+            st  = next((c.text for c in svc if c.tag.split("}")[-1] == "serviceType"), "") or ""
+            cu  = next((c.text for c in svc if c.tag.split("}")[-1] == "controlURL"),  "") or ""
+            if ("WANIPConnection" in st or "WANPPPConnection" in st) and cu:
+                control_url  = base + cu if cu.startswith("/") else base + "/" + cu
+                service_type = st.strip()
+                break
+
+    if not control_url:
+        print("[Mobile] ⚠️  UPnP: no WAN service found")
+        return None
+
+    def _soap(action: str, body: str) -> bytes:
+        envelope = (
+            '<?xml version="1.0"?>'
+            '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
+            's:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">'
+            f"<s:Body>{body}</s:Body></s:Envelope>"
+        )
+        req = urllib.request.Request(
+            control_url,
+            data=envelope.encode(),
+            headers={
+                "Content-Type": "text/xml; charset=utf-8",
+                "SOAPAction": f'"{service_type}#{action}"',
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5) as r:
+            return r.read()
+
+    # --- Get external IP ---
+    external_ip = None
+    try:
+        ip_resp = _soap(
+            "GetExternalIPAddress",
+            f'<u:GetExternalIPAddress xmlns:u="{service_type}"/>',
+        )
+        for el in ET.fromstring(ip_resp).iter():
+            if "NewExternalIPAddress" in el.tag and el.text:
+                external_ip = el.text.strip()
+                break
+    except Exception as e:
+        print(f"[Mobile] ⚠️  UPnP: get IP failed: {e}")
+
+    # --- Add port mapping ---
+    local_ip = _get_local_ip()
+    try:
+        _soap(
+            "AddPortMapping",
+            f'<u:AddPortMapping xmlns:u="{service_type}">'
+            "<NewRemoteHost></NewRemoteHost>"
+            f"<NewExternalPort>{port}</NewExternalPort>"
+            "<NewProtocol>TCP</NewProtocol>"
+            f"<NewInternalPort>{port}</NewInternalPort>"
+            f"<NewInternalClient>{local_ip}</NewInternalClient>"
+            "<NewEnabled>1</NewEnabled>"
+            "<NewPortMappingDescription>JARVIS Remote</NewPortMappingDescription>"
+            "<NewLeaseDuration>86400</NewLeaseDuration>"
+            "</u:AddPortMapping>",
+        )
+    except Exception as e:
+        print(f"[Mobile] ⚠️  UPnP: port mapping failed: {e}")
+
+    return external_ip
 
 
 def start(command_callback: Callable, port: int = 5252) -> tuple[str, int]:
