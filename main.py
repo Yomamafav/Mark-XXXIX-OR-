@@ -31,6 +31,11 @@ from actions.dev_agent         import dev_agent
 from actions.web_search        import web_search as web_search_action
 from actions.computer_control  import computer_control
 from actions.game_updater      import game_updater
+from actions.google_calendar   import google_calendar
+from actions.gmail_reader      import gmail_reader
+from actions.spotify_control   import spotify_control
+import mobile_server
+import actions.proactive_monitor as proactive_monitor
 
 
 def get_base_dir():
@@ -447,6 +452,65 @@ TOOL_DECLARATIONS = [
     }
 },
     {
+        "name": "google_calendar",
+        "description": (
+            "Manages your Google Calendar. "
+            "Use to check today's schedule, find the next meeting, add a new event, or delete one. "
+            "ALWAYS call this for any calendar or schedule question."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":      {"type": "STRING", "description": "list_today | list_events | next_event | create_event | delete_event"},
+                "title":       {"type": "STRING", "description": "Event title (for create/delete)"},
+                "start":       {"type": "STRING", "description": "Start date/time, e.g. 'tomorrow 3pm' or '2026-07-10 14:00'"},
+                "end":         {"type": "STRING", "description": "End date/time (optional, defaults to 1 hour after start)"},
+                "description": {"type": "STRING", "description": "Event description (optional)"},
+                "days":        {"type": "INTEGER", "description": "Days ahead to look for list_events (default: 1)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "gmail",
+        "description": (
+            "Access your Gmail inbox. "
+            "List unread emails, read a specific email, search for emails, or send an email. "
+            "ALWAYS call this for any email-related request."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action":  {"type": "STRING", "description": "list_unread | read_email | search_emails | send_email"},
+                "to":      {"type": "STRING", "description": "Recipient email address (for send_email)"},
+                "subject": {"type": "STRING", "description": "Email subject (for send_email)"},
+                "body":    {"type": "STRING", "description": "Email body text (for send_email)"},
+                "query":   {"type": "STRING", "description": "Search query or Gmail filter (for search_emails/read_email)"},
+                "count":   {"type": "INTEGER", "description": "Number of emails to retrieve (default: 5)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
+        "name": "spotify",
+        "description": (
+            "Controls Spotify music playback. "
+            "Play a song, artist, album or playlist; pause, resume, skip tracks; "
+            "check what's playing; adjust volume. "
+            "ALWAYS call this for any music playback request."
+        ),
+        "parameters": {
+            "type": "OBJECT",
+            "properties": {
+                "action": {"type": "STRING", "description": "play | pause | resume | next | previous | current_track | volume"},
+                "query":  {"type": "STRING", "description": "Song, artist, album or playlist name (for play)"},
+                "type":   {"type": "STRING", "description": "track | artist | album | playlist (default: track)"},
+                "volume": {"type": "INTEGER", "description": "Volume 0-100 (for volume action)"},
+            },
+            "required": ["action"]
+        }
+    },
+    {
     "name": "shutdown_jarvis",
     "description": (
         "Shuts down the assistant completely. "
@@ -503,6 +567,8 @@ class JarvisLive:
         self._is_speaking   = False
         self._speaking_lock = threading.Lock()
         self.ui.on_text_command = self._on_text_command
+        mobile_server.start(self._on_text_command)
+        proactive_monitor.start(self.speak)
 
     def _on_text_command(self, text: str):
         if not self._loop or not self.session:
@@ -520,8 +586,10 @@ class JarvisLive:
             self._is_speaking = value
         if value:
             self.ui.set_state("SPEAKING")
+            mobile_server.set_status("SPEAKING")
         elif not self.ui.muted:
             self.ui.set_state("LISTENING")
+            mobile_server.set_status("LISTENING")
 
     def speak(self, text: str):
         if not self._loop or not self.session:
@@ -683,6 +751,18 @@ class JarvisLive:
             elif name == "flight_finder":
                 r = await loop.run_in_executor(None, lambda: flight_finder(parameters=args, player=self.ui))
                 result = r or "Done."
+            elif name == "google_calendar":
+                r = await loop.run_in_executor(None, lambda: google_calendar(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "gmail":
+                r = await loop.run_in_executor(None, lambda: gmail_reader(parameters=args, player=self.ui))
+                result = r or "Done."
+
+            elif name == "spotify":
+                r = await loop.run_in_executor(None, lambda: spotify_control(parameters=args, player=self.ui))
+                result = r or "Done."
+
             elif name == "shutdown_jarvis":
                 self.ui.write_log("SYS: Shutdown requested.")
                 self.speak("Goodbye, sir.")
@@ -776,11 +856,13 @@ class JarvisLive:
                             full_in = " ".join(in_buf).strip()
                             if full_in:
                                 self.ui.write_log(f"You: {full_in}")
+                                mobile_server.push_log(f"You: {full_in}")
                             in_buf = []
 
                             full_out = " ".join(out_buf).strip()
                             if full_out:
                                 self.ui.write_log(f"Jarvis: {full_out}")
+                                mobile_server.push_log(f"Jarvis: {full_out}")
                             out_buf = []
 
                             if full_in and len(full_in) > 5:
@@ -853,6 +935,8 @@ class JarvisLive:
                     print("[JARVIS] ✅ Connected.")
                     self.ui.set_state("LISTENING")
                     self.ui.write_log("SYS: JARVIS online.")
+                    mobile_server.push_log("SYS: JARVIS online.")
+                    mobile_server.set_status("LISTENING")
 
                     tg.create_task(self._send_realtime())
                     tg.create_task(self._listen_audio())
