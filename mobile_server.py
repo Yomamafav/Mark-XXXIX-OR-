@@ -211,12 +211,45 @@ def _get_local_ip() -> str:
         return "127.0.0.1"
 
 
+def _try_upnp(port: int) -> str | None:
+    try:
+        import miniupnpc
+        upnp = miniupnpc.UPnP()
+        upnp.discoverdelay = 200
+        found = upnp.discover()
+        if not found:
+            print("[Mobile] ⚠️  UPnP: no gateway found")
+            return None
+        upnp.selectigd()
+        local_ip = _get_local_ip()
+        result = upnp.addportmapping(
+            port, "TCP", local_ip, port, "JARVIS Remote", ""
+        )
+        if result is False:
+            print("[Mobile] ⚠️  UPnP: port mapping failed (may already exist)")
+        external_ip = upnp.externalipaddress()
+        return external_ip
+    except ImportError:
+        print("[Mobile] ℹ️  UPnP unavailable — run: pip install miniupnpc")
+        return None
+    except Exception as e:
+        print(f"[Mobile] ⚠️  UPnP error: {e}")
+        return None
+
+
 def start(command_callback: Callable, port: int = 5252) -> tuple[str, int]:
     global _command_callback
     _command_callback = command_callback
     server = HTTPServer(("0.0.0.0", port), _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
-    ip = _get_local_ip()
-    print(f"[Mobile] 📱 Remote at http://{ip}:{port}")
-    return ip, port
+    local_ip = _get_local_ip()
+    print(f"[Mobile] 📱 Local:  http://{local_ip}:{port}")
+    threading.Thread(target=_announce_public, args=(port,), daemon=True).start()
+    return local_ip, port
+
+
+def _announce_public(port: int) -> None:
+    public_ip = _try_upnp(port)
+    if public_ip:
+        print(f"[Mobile] 🌐 Public: http://{public_ip}:{port}  ← use this off-network")
