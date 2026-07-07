@@ -4,6 +4,17 @@ import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Callable
 
+
+class _DualStackServer(HTTPServer):
+    address_family = socket.AF_INET6
+
+    def server_bind(self):
+        try:
+            self.socket.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+        except Exception:
+            pass
+        super().server_bind()
+
 _log_entries: list[str] = []
 _log_lock = threading.Lock()
 _command_callback: Callable | None = None
@@ -334,7 +345,7 @@ def _try_upnp(port: int) -> str | None:
 def start(command_callback: Callable, port: int = 5252) -> tuple[str, int]:
     global _command_callback
     _command_callback = command_callback
-    server = HTTPServer(("0.0.0.0", port), _Handler)
+    server = _DualStackServer(("::", port), _Handler)
     t = threading.Thread(target=server.serve_forever, daemon=True)
     t.start()
     local_ip = _get_local_ip()
@@ -343,7 +354,59 @@ def start(command_callback: Callable, port: int = 5252) -> tuple[str, int]:
     return local_ip, port
 
 
+def _get_ipv6() -> str | None:
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET6):
+            ip = info[4][0]
+            if ip.startswith("2") and ":" in ip and not ip.startswith("fe80"):
+                return ip
+    except Exception:
+        pass
+    return None
+
+
+def _print_qr(url: str, label: str) -> None:
+    try:
+        import qrcode
+        qr = qrcode.QRCode(border=1)
+        qr.add_data(url)
+        qr.make(fit=True)
+        print(f"\n[Mobile] {label}: {url}")
+        qr.print_ascii(invert=True)
+    except Exception:
+        pass
+
+
+def _save_qr(url: str, path: str) -> None:
+    try:
+        import qrcode
+        img = qrcode.make(url)
+        img.save(path)
+        print(f"[Mobile] 💾 QR saved → {path}")
+    except Exception:
+        pass
+
+
 def _announce_public(port: int) -> None:
-    public_ip = _try_upnp(port)
-    if public_ip:
-        print(f"[Mobile] 🌐 Public: http://{public_ip}:{port}  ← use this off-network")
+    from pathlib import Path
+    local_ip  = _get_local_ip()
+    local_url = f"http://{local_ip}:{port}"
+
+    ipv6 = _get_ipv6()
+    if ipv6:
+        public_url = f"http://[{ipv6}]:{port}"
+        print(f"[Mobile] 🌐 Public: {public_url}  ← works off-network")
+        _print_qr(public_url, "Scan for off-network access")
+        desktop = Path.home() / "Desktop" / "JARVIS_Mobile_QR.png"
+        _save_qr(public_url, str(desktop))
+    else:
+        public_url = None
+        upnp_ip = _try_upnp(port)
+        if upnp_ip:
+            public_url = f"http://{upnp_ip}:{port}"
+            print(f"[Mobile] 🌐 Public: {public_url}  ← works off-network")
+            _print_qr(public_url, "Scan for off-network access")
+            desktop = Path.home() / "Desktop" / "JARVIS_Mobile_QR.png"
+            _save_qr(public_url, str(desktop))
+
+    _print_qr(local_url, "Scan for local access")
